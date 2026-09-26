@@ -55,13 +55,20 @@ choices**, not claims about the unpublished official Long3D evaluator:
    ICP to refine uniform scale. This is an alternative sensitivity experiment,
    not the default.
 3. No Long3D crop is applied. Confidence filtering is disabled by default.
-4. To make 432 million cached points tractable, the default evaluation point
-   set uses a 2D pixel stride of 4 and a 0.02-unit, origin-anchored voxel grid.
-   A voxel is represented by the mean of its points. GT is passed through the
-   same voxel rule. These choices materially affect metrics and are always
-   recorded. Set `--point_stride 1 --voxel_size 0` only if sufficient RAM is
-   available; this exact path may require many gigabytes.
-5. Preview PLYs use `--preview_voxel_size` and are never used for metrics.
+4. To make 432 million cached points tractable, the default metric point set
+   uses a 2D pixel stride of 4 and a 0.02-unit, origin-anchored voxel grid. The
+   prediction is transformed into GT/world coordinates **before** this grid is
+   applied, so 0.02 has the same physical meaning for prediction and GT. A
+   voxel is represented by the mean of its points. These choices materially
+   affect metrics and are always recorded. Set `--point_stride 1 --voxel_size
+   0` only if sufficient RAM is available; this exact path may require many
+   gigabytes.
+5. ICP uses a separate alignment-only cloud, downsampled in GT/world units with
+   `--alignment_voxel_size`. The default 0.10 is a reproduction assumption and
+   does not change either metric point set. Setting it to 0 reuses the metric
+   clouds for ICP.
+6. Preview PLYs use `--preview_voxel_size`; visualization sampling is never
+   used for alignment or metrics.
 
 For a defensible reproduction, report the chosen alignment mode and run
 sensitivity checks. Do not describe these results as matching the paper's
@@ -80,6 +87,22 @@ official protocol unless the authors publish the missing details.
 An externally justified prediction-to-GT transform can be supplied as a JSON
 4x4 matrix via `--init_transform`. This is the preferred route if scanner poses
 or camera correspondences become available.
+
+## Evaluation order and point counts
+
+The evaluator makes two streaming passes over the caches. The first applies
+pixel stride, finite filtering, and optional confidence filtering while keeping
+only bounds and counters. Those bounds estimate the initial scale/translation.
+The second pass applies that initial transform to each filtered chunk first,
+then feeds independent GT-unit voxel accumulators for metrics and alignment.
+ICP is estimated only from the alignment clouds and its refinement is applied
+to the prediction metric cloud before Accuracy, Completeness, NC, and CD.
+
+`metrics.json` records `point_counts.prediction` and
+`point_counts.ground_truth`, each with `raw`, `after_stride`,
+`after_transform`, `after_metric_voxel`, `alignment_points`, and
+`metric_points`. For GT, `after_stride` and `after_transform` equal `raw`
+because GT begins in world units and is not pixel-strided or transformed.
 
 ## Install
 
@@ -112,12 +135,14 @@ the paper's Classroom row.
 python evaluate_long3d.py \
   --cache_dir /root/autodl-tmp/InfiniteVGGT-data/results/exp001_classroom_100/frame_cache \
   --gt_path /root/autodl-tmp/InfiniteVGGT-data/datasets/Long3D/Classroom/dense_cloud_map.pcd \
-  --output_dir /root/InfiniteVGGT-eval/outputs/classroom_100_smoke \
+  --output_dir /root/InfiniteVGGT-eval/outputs/classroom_100_smoke_postscale_voxel \
   --max_frames 100 \
   --point_stride 4 \
   --voxel_size 0.02 \
   --conf_thresh none \
   --alignment_mode scale_then_icp \
+  --alignment_voxel_size 0.10 \
+  --preview_voxel_size 0.10 \
   --icp_threshold 0.1
 ```
 
@@ -127,21 +152,22 @@ python evaluate_long3d.py \
 python evaluate_long3d.py \
   --cache_dir /root/autodl-tmp/InfiniteVGGT-data/results/exp002_classroom_full/frame_cache \
   --gt_path /root/autodl-tmp/InfiniteVGGT-data/datasets/Long3D/Classroom/dense_cloud_map.pcd \
-  --output_dir /root/InfiniteVGGT-eval/outputs/classroom_full_scale_then_icp \
-  --max_frames -1 \
+  --output_dir /root/InfiniteVGGT-eval/outputs/classroom_full_postscale_voxel \
+  --max_frames 2128 \
   --point_stride 4 \
   --voxel_size 0.02 \
   --conf_thresh none \
   --alignment_mode scale_then_icp \
+  --alignment_voxel_size 0.10 \
+  --preview_voxel_size 0.10 \
   --icp_threshold 0.1
 ```
 
 The output directory contains `metrics.json`, `summary.txt`,
-`alignment.json`, `pred_before_alignment.ply`, `pred_aligned.ply`, and
-`gt_used.ply`. The two prediction PLYs are visualization previews at
-`preview_voxel_size`; `gt_used.ply` is the exact post-evaluation-voxel GT point
-set. Exact metric counts and all filtering/alignment parameters are stored in
-JSON.
+`alignment.json`, `pred_initial_aligned_preview.ply`,
+`pred_aligned_preview.ply`, and `gt_preview.ply`. All three PLYs are
+visualization-only samples at `preview_voxel_size`. Exact stage counts and all
+filtering/alignment parameters are stored in JSON.
 
 ## Fair comparisons
 

@@ -218,6 +218,141 @@ class BuildStats:
         return dict(self.__dict__)
 
 
+@dataclass
+class PredictionScan:
+    """First-pass statistics for filtered prediction points.
+
+    Bounds are kept separately from JSON-facing counters so initial scale can
+    be estimated without retaining the full native-scale prediction cloud.
+    """
+
+    frames: int = 0
+    raw: int = 0
+    after_stride: int = 0
+    finite: int = 0
+    confidence_rejected: int = 0
+    after_filter: int = 0
+    minimum: Optional[np.ndarray] = None
+    maximum: Optional[np.ndarray] = None
+
+    def update_bounds(self, points: np.ndarray) -> None:
+        if not len(points):
+            return
+        chunk_min = points.min(axis=0)
+        chunk_max = points.max(axis=0)
+        self.minimum = chunk_min if self.minimum is None else np.minimum(self.minimum, chunk_min)
+        self.maximum = chunk_max if self.maximum is None else np.maximum(self.maximum, chunk_max)
+
+    def filtering_dict(self) -> dict[str, int]:
+        return {
+            "frames": self.frames,
+            "finite": self.finite,
+            "confidence_rejected": self.confidence_rejected,
+            "after_filter": self.after_filter,
+        }
+
+
+def _filtered_prediction_chunk(
+    path: Path,
+    point_stride: int,
+    conf_thresh: Optional[float],
+) -> tuple[np.ndarray, int, int, int, int]:
+    """Load and filter one cache, returning points and stage counts."""
+    cache = torch_load_cpu(path)
+    points, conf = extract_prediction(cache)
+    raw_count = int(points.shape[0] * points.shape[1])
+    points = points[::point_stride, ::point_stride, :].reshape(-1, 3)
+    if conf is not None:
+        conf = conf[::point_stride, ::point_stride].reshape(-1)
+    after_stride = len(points)
+    valid = np.isfinite(points).all(axis=1)
+    if conf is not None:
+        valid &= np.isfinite(conf)
+    finite_count = int(valid.sum())
+    confidence_rejected = 0
+    if conf_thresh is not None:
+        if conf is None:
+            raise ValueError(
+                f"conf_thresh was set but {path.name} contains no confidence tensor"
+            )
+        valid &= conf > conf_thresh
+        confidence_rejected = finite_count - int(valid.sum())
+    return points[valid], raw_count, after_stride, finite_count, confidence_rejected
+
+
+def scan_prediction_points(
+    files: Iterable[Path],
+    point_stride: int,
+    conf_thresh: Optional[float],
+) -> PredictionScan:
+    """First streaming pass: count/filter points and collect native bounds."""
+    if point_stride < 1:
+        raise ValueError("point_stride must be >= 1")
+    scan = PredictionScan()
+    for path in files:
+        points, raw, after_stride, finite, rejected = _filtered_prediction_chunk(
+            path, point_stride, conf_thresh
+        )
+        scan.frames += 1
+        scan.raw += raw
+        scan.after_stride += after_stride
+        scan.finite += finite
+        scan.confidence_rejected += rejected
+        scan.after_filter += len(points)
+        scan.update_bounds(points)
+    if scan.minimum is None or scan.maximum is None:
+        raise ValueError("No valid prediction points survived filtering")
+    return scan
+
+
+def build_transformed_prediction_points(
+    files: Iterable[Path],
+    point_stride: int,
+    conf_thresh: Optional[float],
+    initial_transform: np.ndarray,
+    metric_voxel_size: float,
+    alignment_voxel_size: float,
+    flush_points: int = 2_000_000,
+) -> tuple[np.ndarray, np.ndarray, int]:
+    """Second streaming pass: transform to GT units, then sample.
+
+    Metric voxelization is deliberately performed only after
+    ``initial_transform`` has put prediction points into the GT coordinate and
+    scale system. The alignment accumulator is independent of the metric
+    accumulator. With an alignment voxel size of zero, the metric cloud is
+    reused for ICP rather than retaining another unbounded point set.
+    """
+    if point_stride < 1:
+        raise ValueError("point_stride must be >= 1")
+    if metric_voxel_size < 0 or alignment_voxel_size < 0:
+        raise ValueError("voxel sizes must be >= 0")
+    metric_accumulator = StreamingPointAccumulator(
+        metric_voxel_size, flush_points=flush_points
+    )
+    alignment_accumulator = (
+        StreamingPointAccumulator(alignment_voxel_size, flush_points=flush_points)
+        if alignment_voxel_size > 0
+        else None
+    )
+    after_transform = 0
+    for path in files:
+        points, _, _, _, _ = _filtered_prediction_chunk(
+            path, point_stride, conf_thresh
+        )
+        transformed = apply_transform(points, initial_transform)
+        after_transform += len(transformed)
+        metric_accumulator.add(transformed)
+        if alignment_accumulator is not None:
+            alignment_accumulator.add(transformed)
+    metric_points = metric_accumulator.finalize()
+    alignment_points = (
+        alignment_accumulator.finalize()
+        if alignment_accumulator is not None
+        else metric_points
+    )
+    return metric_points, alignment_points, after_transform
+
+
 def build_prediction_points(
     files: Iterable[Path],
     point_stride: int,
@@ -299,6 +434,20 @@ def extent_scale_initialization(pred: np.ndarray, gt: np.ndarray) -> np.ndarray:
     """Reproduction choice: match maximum axis extent, then AABB centers."""
     pred_min, pred_max = pred.min(axis=0), pred.max(axis=0)
     gt_min, gt_max = gt.min(axis=0), gt.max(axis=0)
+    return extent_scale_initialization_from_bounds(pred_min, pred_max, gt_min, gt_max)
+
+
+def extent_scale_initialization_from_bounds(
+    pred_min: np.ndarray,
+    pred_max: np.ndarray,
+    gt_min: np.ndarray,
+    gt_max: np.ndarray,
+) -> np.ndarray:
+    """Reproduction assumption: match max AABB extent and AABB centers."""
+    pred_min = np.asarray(pred_min, dtype=np.float64)
+    pred_max = np.asarray(pred_max, dtype=np.float64)
+    gt_min = np.asarray(gt_min, dtype=np.float64)
+    gt_max = np.asarray(gt_max, dtype=np.float64)
     pred_extent = float(np.max(pred_max - pred_min))
     gt_extent = float(np.max(gt_max - gt_min))
     if pred_extent <= 0 or not math.isfinite(pred_extent):
@@ -308,6 +457,30 @@ def extent_scale_initialization(pred: np.ndarray, gt: np.ndarray) -> np.ndarray:
     transform[:3, :3] *= scale
     transform[:3, 3] = (gt_min + gt_max) / 2.0 - scale * (pred_min + pred_max) / 2.0
     return transform
+
+
+def estimate_initial_transform(
+    pred_min: np.ndarray,
+    pred_max: np.ndarray,
+    gt: np.ndarray,
+    mode: str,
+    initial_transform: Optional[np.ndarray] = None,
+) -> tuple[np.ndarray, str]:
+    """Estimate the transform that puts native prediction coordinates in GT units."""
+    gt = _as_points(gt, "gt")
+    if mode not in {"none", "rigid_icp", "scale_then_icp", "sim3_icp"}:
+        raise ValueError(f"Unsupported alignment mode: {mode}")
+    if initial_transform is not None:
+        init = np.asarray(initial_transform, dtype=np.float64)
+        if init.shape != (4, 4) or not np.isfinite(init).all():
+            raise ValueError("initial_transform must be a finite 4x4 matrix")
+        return init, "user_json"
+    if mode in {"scale_then_icp", "sim3_icp"}:
+        init = extent_scale_initialization_from_bounds(
+            pred_min, pred_max, gt.min(axis=0), gt.max(axis=0)
+        )
+        return init, "max_extent_and_aabb_center"
+    return np.eye(4, dtype=np.float64), "identity"
 
 
 def decompose_similarity(transform: np.ndarray) -> tuple[float, np.ndarray, np.ndarray]:
@@ -335,85 +508,42 @@ def read_transform(path: Path) -> np.ndarray:
     return matrix
 
 
-def align_point_clouds(
-    pred: np.ndarray,
-    gt: np.ndarray,
+def refine_alignment(
+    pred_in_gt_units: np.ndarray,
+    gt_in_gt_units: np.ndarray,
     mode: str,
     icp_threshold: float,
-    initial_transform: Optional[np.ndarray] = None,
-    alignment_voxel_size: float = 0.0,
-) -> tuple[np.ndarray, dict[str, Any]]:
-    """Align prediction to GT; ICP thresholds are interpreted in GT units."""
-    o3d = require_open3d()
-    pred = _as_points(pred, "pred")
-    gt = _as_points(gt, "gt")
+) -> tuple[np.ndarray, Optional[float], Optional[float], Optional[str]]:
+    """Run ICP on alignment-only clouds already expressed in GT units."""
+    pred = _as_points(pred_in_gt_units, "pred_in_gt_units")
+    gt = _as_points(gt_in_gt_units, "gt_in_gt_units")
     if icp_threshold <= 0:
         raise ValueError("icp_threshold must be > 0")
     if mode not in {"none", "rigid_icp", "scale_then_icp", "sim3_icp"}:
         raise ValueError(f"Unsupported alignment mode: {mode}")
-
-    if initial_transform is not None:
-        init = np.asarray(initial_transform, dtype=np.float64)
-        init_source = "user_json"
-    elif mode in {"scale_then_icp", "sim3_icp"}:
-        init = extent_scale_initialization(pred, gt)
-        init_source = "max_extent_and_aabb_center"
-    else:
-        init = np.eye(4, dtype=np.float64)
-        init_source = "identity"
-
-    fitness = None
-    inlier_rmse = None
-    icp_transform = np.eye(4, dtype=np.float64)
     if mode == "none":
-        final = init if initial_transform is not None else np.eye(4, dtype=np.float64)
-    else:
-        pred_init = apply_transform(pred, init)
-        source = make_point_cloud(pred_init)
-        target = make_point_cloud(gt)
-        if alignment_voxel_size > 0:
-            source = source.voxel_down_sample(alignment_voxel_size)
-            target = target.voxel_down_sample(alignment_voxel_size)
-        with_scaling = mode == "sim3_icp"
-        estimator = o3d.pipelines.registration.TransformationEstimationPointToPoint(
-            with_scaling
-        )
-        registration = o3d.pipelines.registration.registration_icp(
-            source,
-            target,
-            icp_threshold,
-            np.eye(4, dtype=np.float64),
-            estimator,
-        )
-        icp_transform = np.asarray(registration.transformation, dtype=np.float64)
-        final = icp_transform @ init
-        fitness = float(registration.fitness)
-        inlier_rmse = float(registration.inlier_rmse)
+        return np.eye(4, dtype=np.float64), None, None, None
 
-    aligned = apply_transform(pred, final)
-    scale, rotation, translation = decompose_similarity(final)
-    metadata = {
-        "alignment_mode": mode,
-        "initialization": init_source,
-        "initial_transform": init.tolist(),
-        "icp_transform": icp_transform.tolist(),
-        "transformation": final.tolist(),
-        "scale": scale,
-        "rotation": rotation.tolist(),
-        "translation": translation.tolist(),
-        "icp_threshold": float(icp_threshold),
-        "icp_fitness": fitness,
-        "icp_inlier_rmse": inlier_rmse,
-        "icp_estimator": (
-            None
-            if mode == "none"
-            else "point_to_point_with_scaling"
-            if mode == "sim3_icp"
-            else "point_to_point"
-        ),
-        "alignment_voxel_size": float(alignment_voxel_size),
-    }
-    return aligned, metadata
+    o3d = require_open3d()
+    estimator_name = (
+        "point_to_point_with_scaling" if mode == "sim3_icp" else "point_to_point"
+    )
+    estimator = o3d.pipelines.registration.TransformationEstimationPointToPoint(
+        mode == "sim3_icp"
+    )
+    registration = o3d.pipelines.registration.registration_icp(
+        make_point_cloud(pred),
+        make_point_cloud(gt),
+        icp_threshold,
+        np.eye(4, dtype=np.float64),
+        estimator,
+    )
+    return (
+        np.asarray(registration.transformation, dtype=np.float64),
+        float(registration.fitness),
+        float(registration.inlier_rmse),
+        estimator_name,
+    )
 
 
 def evaluate_metrics(pred_aligned: np.ndarray, gt: np.ndarray) -> dict[str, float]:

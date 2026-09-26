@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Stream InfiniteVGGT per-frame caches into an evaluation point cloud."""
+"""Stream caches into a standalone cloud in native prediction coordinates.
+
+The evaluator does not use this utility: metric voxelization must happen only
+after prediction-to-GT scale initialization in ``evaluate_long3d.py``.
+"""
 
 from __future__ import annotations
 
@@ -29,13 +33,21 @@ def optional_int(value: str):
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Build a Long3D prediction cloud without accumulating raw frames."
+        description=(
+            "Build a standalone native-coordinate prediction cloud. "
+            "Do not use this output as a metric cloud before alignment."
+        )
     )
     parser.add_argument("--cache_dir", type=Path, required=True)
     parser.add_argument("--output_path", type=Path, required=True)
     parser.add_argument("--max_frames", type=optional_int, default=-1)
     parser.add_argument("--point_stride", type=int, default=4)
-    parser.add_argument("--voxel_size", type=float, default=0.02)
+    parser.add_argument(
+        "--voxel_size",
+        type=float,
+        default=0.02,
+        help="Standalone output voxel size in native prediction units.",
+    )
     parser.add_argument(
         "--conf_thresh",
         type=optional_float,
@@ -76,7 +88,7 @@ def main() -> None:
         "preview_voxel_size": args.preview_voxel_size if args.preview_path else None,
     }
     write_json(args.output_path.with_suffix(".json"), metadata)
-    print(f"Wrote {len(points):,} evaluation points to {args.output_path}")
+    print(f"Wrote {len(points):,} native-coordinate output points to {args.output_path}")
 
 
 if __name__ == "__main__":
